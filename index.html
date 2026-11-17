@@ -701,6 +701,12 @@ let darkStreak = 0, brightStreak = 0, lastLensWarnTime = 0, lastTiltWarnTime = 0
 
 let objectModel = null, objectModelLoading = null, isScanningFrame = false, liveMonitorTimer = null;
 let lastHazardAlertKey = '', lastHazardAlertTime = 0, prevCenterThreat = null;
+// حالة كاشف الأجسام: إعادة المحاولة بعد فشل التحميل، وعدّاد أخطاء الرصد (لا فشل صامت)
+let lastCocoLoadAttempt = 0, cocoLoadFailNotified = false, cocoDetectFails = 0, lastCocoFailNotice = 0;
+const COCO_RETRY_MS = 20000, COCO_FAIL_NOTICE_MS = 60000, COCO_MAX_BOXES = 10;
+// أولوية الجملة المنطوقة حالياً (2 = تنبيه اقتراب عاجل). تُضبط لكل مقطع عند بدء نطقه.
+let speechPriority = 0;
+function urgentSpeechActive() { return assistantSpeaking && speechPriority >= 2; }
 let ocrWorker = null, ocrWorkerLang = '', ocrInitPromise = null;
 // عامل عربي مستقل للمستندات العربية الخالصة؛ يعيد استخدام ملف ara المحفوظ في IndexedDB.
 let ocrArabicWorker = null, ocrArabicInitPromise = null;
@@ -943,11 +949,38 @@ spatialAudioCheckbox.addEventListener('change', () => { spatialAudioEnabled = sp
 autoTorchCheckbox.checked = autoTorchEnabled;
 autoTorchCheckbox.addEventListener('change', () => { autoTorchEnabled = autoTorchCheckbox.checked; writeLS(LS_AUTO_TORCH, autoTorchEnabled); updateTorchUI(); });
 
+// iOS لا يقبل requestPermission() إلا من داخل لمسة مستخدم، والتطبيق يبدأ تلقائياً عند التحميل بلا لمسة.
+// لذلك نعيد المحاولة عند أول لمسة حتى ينجح الربط (أو يُرفض صراحةً)، بدل الفشل الصامت الدائم.
+let orientationAttached = false, orientationDenied = false, orientationPermissionPending = false, orientationGestureHooked = false;
+function attachOrientationListener() {
+  if (orientationAttached) return;
+  orientationAttached = true;
+  window.addEventListener('deviceorientation', ev => { if (typeof ev.beta === 'number') phonePitchBeta = ev.beta; }, { passive: true });
+}
+function orientationGestureRetry() {
+  if (orientationAttached || orientationDenied) { unhookOrientationGesture(); return; }
+  initOrientationSensor();
+}
+function hookOrientationGesture() {
+  if (orientationGestureHooked || !document.addEventListener) return;
+  orientationGestureHooked = true;
+  ['click', 'touchend', 'pointerup'].forEach(t => document.addEventListener(t, orientationGestureRetry, { passive: true }));
+}
+function unhookOrientationGesture() {
+  if (!orientationGestureHooked || !document.removeEventListener) return;
+  orientationGestureHooked = false;
+  ['click', 'touchend', 'pointerup'].forEach(t => document.removeEventListener(t, orientationGestureRetry));
+}
 function initOrientationSensor() {
-  if (!window.DeviceOrientationEvent) return;
-  const attach = () => window.addEventListener('deviceorientation', ev => { if (typeof ev.beta === 'number') phonePitchBeta = ev.beta; }, { passive: true });
-  if (typeof DeviceOrientationEvent.requestPermission === 'function') DeviceOrientationEvent.requestPermission().then(s => { if (s === 'granted') attach(); }).catch(() => {});
-  else attach();
+  if (!window.DeviceOrientationEvent || orientationAttached || orientationDenied) return;
+  if (typeof DeviceOrientationEvent.requestPermission !== 'function') { attachOrientationListener(); return; }
+  if (orientationPermissionPending) return;
+  orientationPermissionPending = true;
+  DeviceOrientationEvent.requestPermission().then(s => {
+    if (s === 'granted') { attachOrientationListener(); unhookOrientationGesture(); }
+    else if (s === 'denied') { orientationDenied = true; unhookOrientationGesture(); }
+  }).catch(() => { hookOrientationGesture(); })     // رُفض لغياب لمسة ⇒ نجرّب عند أول لمسة
+    .then(() => { orientationPermissionPending = false; });
 }
 
 let englishVoice = null;
@@ -1018,6 +1051,7 @@ function processSpeechQueue() {
   }
   speechQueueRunning = true;
   assistantSpeaking = true;
+  speechPriority = item.priority || 0;
   const utterance = new SpeechSynthesisUtterance(item.text);
   if (item.lang === 'en') {
     utterance.lang = englishVoice?.lang || 'en-US';
@@ -1040,7 +1074,7 @@ function processSpeechQueue() {
   speechWatchdog = setTimeout(finish, expected);
   try { window.speechSynthesis.speak(utterance); } catch (e) { finish(); }
 }
-function speak(text, interrupt = true) {
+function speak(text, interrupt = true, priority = 0) {
   if (!('speechSynthesis' in window) || !text) return;
   if (interrupt) {
     speechQueueToken++;
@@ -1053,7 +1087,7 @@ function speak(text, interrupt = true) {
     assistantSpeaking = false;
   }
   const token = speechQueueToken;
-  speechQueue.push(...splitSpeechRuns(text).map(item => ({ ...item, token })));
+  speechQueue.push(...splitSpeechRuns(text).map(item => ({ ...item, token, priority })));
   if (!speechQueueRunning) {
     // Some Android browsers populate the voice list shortly after page load.
     if (!window.speechSynthesis.getVoices().length && !speechVoiceWaitTimer) {
@@ -2519,61 +2553,119 @@ function estimateObjectDistance(pred, vw, vh) {
   return { meters: mr, steps, text: 'نحو ' + steps + (steps <= 10 ? ' خطوات' : ' خطوة') + ' (' + mr + ' متر)' };
 }
 
+function notifyCocoLoadFailure(msg) {
+  // نُعلن الفشل بالصوت مرة واحدة لكل سلسلة فشل (الشارة النصية لا يراها الكفيف)
+  if (cocoLoadFailNotified) return;
+  cocoLoadFailNotified = true;
+  updateStatus(msg); speak(msg, false);
+}
 async function initLocalObjectEngine() {
   if (!localScanEnabled) { localScannerBadge.textContent = 'الأجسام والمسافة: متوقفة'; return null; }
   if (objectModel) return objectModel;
   if (objectModelLoading) return objectModelLoading;
-  if (typeof cocoSsd === 'undefined') { localScannerBadge.textContent = 'الأجسام: غير متاحة'; return null; }
+  if (typeof cocoSsd === 'undefined') {
+    localScannerBadge.textContent = 'الأجسام: غير متاحة';
+    notifyCocoLoadFailure('كاشف الأجسام غير متاح الآن، والتنبيهات المستمرة للأجسام متوقفة. اتصل بالإنترنت مرة واحدة ثم أعد فتح التطبيق، واستعمل العصا.');
+    return null;
+  }
   localScannerBadge.textContent = 'الأجسام والمسافة: جارٍ التحميل...';
+  lastCocoLoadAttempt = Date.now();
   objectModelLoading = cocoSsd.load({ base: 'lite_mobilenet_v2' }).then(m => {
-    objectModel = m; localScannerBadge.textContent = 'الأجسام والمسافة: نشط'; return m;
-  }).catch(() => { localScannerBadge.textContent = 'الأجسام: تعذر التحميل'; return null; });
+    objectModel = m; cocoLoadFailNotified = false; localScannerBadge.textContent = 'الأجسام والمسافة: نشط'; return m;
+  }).catch(() => {
+    // كان الوعد الفاشل يبقى محفوظاً فلا تُعاد المحاولة أبداً؛ نُفرّغه ليُعاد التحميل تلقائياً من حلقة الرصد
+    objectModelLoading = null;
+    localScannerBadge.textContent = 'الأجسام: تعذر التحميل';
+    notifyCocoLoadFailure('تعذر تحميل كاشف الأجسام. سأعيد المحاولة تلقائياً. استعمل العصا في هذه الأثناء.');
+    return null;
+  });
   return objectModelLoading;
 }
 
 function getRelativePositionArabic(bbox, vw) { if (!bbox || !vw) return 'في الوسط'; const r = (bbox[0] + bbox[2] / 2) / vw; return r < 0.34 ? 'على اليسار' : (r > 0.66 ? 'على اليمين' : 'أمامك'); }
 function sideFromPosition(pos) { return pos === 'على اليسار' ? 'left' : (pos === 'على اليمين' ? 'right' : 'center'); }
 
+// ترتيب الأجسام المعروفة: الأولوية الأعلى ثم الأقرب (المسافة التقديرية) ثم الأعلى ثقة.
+// (كان الترتيب بالأولوية ثم الثقة فقط، فيتقدّم شخص بعيد عالي الثقة على سيارة قريبة.)
+function rankLocalObjects(preds, vw, vh) {
+  return (preds || []).filter(p => p && p.bbox && LOCAL_OBJECT_MAP[p.class])
+    .map(p => ({ p, meta: LOCAL_OBJECT_MAP[p.class], dist: estimateObjectDistance(p, vw, vh) }))
+    .sort((a, b) => (b.meta.priority - a.meta.priority)
+      || ((a.dist ? a.dist.meters : Infinity) - (b.dist ? b.dist.meters : Infinity))
+      || ((b.p.score || 0) - (a.p.score || 0)));
+}
+
+async function liveMonitorTick() {
+  if (isProcessing || isListening || isScanningFrame) return;
+  if (!videoElement || videoElement.paused || videoElement.ended || videoElement.videoWidth === 0) return;
+  const q = probeFrameQuality();
+  await evaluateContinuousAutoTorch(q);
+  if (!navModeEnabled || !localScanEnabled || lifeMode === 'grooming' || lifeMode === 'clothes') return;
+  if (!objectModel) {
+    // فشل تحميل سابق: نعيد المحاولة بفاصل ثابت بدل التعطل الدائم
+    if (!objectModelLoading && (Date.now() - lastCocoLoadAttempt) > COCO_RETRY_MS) initLocalObjectEngine();
+    return;
+  }
+  if (!assistantSpeaking && lifeMode === 'walk' && phonePitchBeta !== null && (Date.now() - lastTiltWarnTime) > 14000) {
+    if (phonePitchBeta > 112) { lastTiltWarnTime = Date.now(); speak('الكاميرا متجهة للأعلى؛ أمِل الهاتف للأمام قليلاً ليرى الطريق.', false); return; }
+    if (phonePitchBeta < 18)  { lastTiltWarnTime = Date.now(); speak('الكاميرا تنظر لأسفل جداً؛ ارفعها قليلاً.', false); return; }
+  }
+  isScanningFrame = true;
+  try {
+    // الرصد يستمر أثناء كلام المساعد (كان يتوقف فيُترك المستخدم بلا رصد طوال الجملة)؛ الذي يُنطق أثناء الكلام هو الاقتراب العاجل فقط
+    const vw = videoElement.videoWidth, vh = videoElement.videoHeight;
+    const preds = await objectModel.detect(videoElement, COCO_MAX_BOXES, 0.56);
+    if (cocoDetectFails >= 3) localScannerBadge.textContent = 'الأجسام والمسافة: نشط';
+    cocoDetectFails = 0;
+    lastCocoPreds = { t: Date.now(), preds: preds || [], vw, vh };
+    const ranked = rankLocalObjects(preds, vw, vh), now = Date.now();
+    // الاقتراب: يُتتبَّع أكبر جسم أولويته ≥3 في الوسط مستقلاً عن ترتيب التنبيه (كان يُصفَّر إن تقدّم عليه جسم جانبي)
+    let center = null;
+    for (const r of ranked) {
+      if (r.meta.priority >= 3 && getRelativePositionArabic(r.p.bbox, vw) === 'أمامك') {
+        const a = r.p.bbox[2] * r.p.bbox[3];
+        if (!center || a > center.area) center = { r, area: a };
+      }
+    }
+    let loomingUrgent = false;
+    if (center) {
+      const cls = center.r.p.class;
+      if (prevCenterThreat && prevCenterThreat.cls === cls && (now - prevCenterThreat.t) < 2000 && prevCenterThreat.area > 0 && ((center.area - prevCenterThreat.area) / prevCenterThreat.area) >= 0.34) loomingUrgent = true;
+      prevCenterThreat = { cls, area: center.area, t: now };
+    } else prevCenterThreat = null;
+    if (!ranked.length) return;
+    const pick = loomingUrgent ? center.r : ranked[0], top = pick.p, meta = pick.meta, dist = pick.dist;
+    const pos = getRelativePositionArabic(top.bbox, vw);
+    const key = (loomingUrgent ? 'LOOM_' : 'obj_') + top.class + '_' + pos;
+    if (assistantSpeaking) {
+      if (!loomingUrgent) return;                                   // غير العاجل ينتظر انتهاء الكلام
+      if (urgentSpeechActive() && key === lastHazardAlertKey) return; // نفس التنبيه العاجل يُنطق الآن؛ لا نقطعه ونعيده
+    }
+    if (loomingUrgent || key !== lastHazardAlertKey || (now - lastHazardAlertTime) > 6500) {
+      lastHazardAlertKey = key; lastHazardAlertTime = now;
+      const urgent = loomingUrgent || meta.priority >= 3 || (dist && dist.steps <= 2);
+      playSpatialBeep(sideFromPosition(pos), urgent);
+      vibrate(loomingUrgent ? [120, 45, 120, 45, 120] : (urgent ? [85, 55, 85] : [35]));
+      const msg = loomingUrgent ? ('انتبه! ' + meta.ar + ' تقترب منك بسرعة ' + (dist ? ('— ' + dist.text) : '') + '!') : (meta.ar + ' ' + pos + (dist ? (' — ' + dist.text) : '') + '.');
+      updateStatus(msg); updateRiskIndicator(urgent ? 'يستلزم الحذر' : 'لم يظهر خطر واضح في الصورة'); speak(msg, true, loomingUrgent ? 2 : 0);
+    }
+  } catch (e) {
+    // لا فشل صامت: بعد 3 أخطاء متتالية نُعلن بالصوت (مرة كل دقيقة) ونُحدّث الشارة
+    cocoDetectFails++;
+    if (cocoDetectFails >= 3 && (Date.now() - lastCocoFailNotice) > COCO_FAIL_NOTICE_MS) {
+      lastCocoFailNotice = Date.now();
+      localScannerBadge.textContent = 'الأجسام: خطأ في الرصد';
+      const m = 'تعذر رصد الأجسام تلقائياً الآن. لا تعتمد على التنبيهات واستعمل العصا.';
+      updateStatus(m); speak(m, false);
+    }
+  } finally { isScanningFrame = false; }
+}
+
 function startLiveMonitoring() {
   startLiveRecognition();
   if (liveMonitorTimer) return;
   if (localScanEnabled && lifeMode !== 'grooming') initLocalObjectEngine();
-  liveMonitorTimer = setInterval(async () => {
-    if (isProcessing || isListening || isScanningFrame) return;
-    if (!videoElement || videoElement.paused || videoElement.ended || videoElement.videoWidth === 0) return;
-    const q = probeFrameQuality();
-    await evaluateContinuousAutoTorch(q);
-    if (!navModeEnabled || !localScanEnabled || assistantSpeaking || !objectModel || lifeMode === 'grooming' || lifeMode === 'clothes') return;
-    if (lifeMode === 'walk' && phonePitchBeta !== null && (Date.now() - lastTiltWarnTime) > 14000) {
-      if (phonePitchBeta > 112) { lastTiltWarnTime = Date.now(); speak('الكاميرا متجهة للأعلى؛ أمِل الهاتف للأمام قليلاً ليرى الطريق.', false); return; }
-      if (phonePitchBeta < 18)  { lastTiltWarnTime = Date.now(); speak('الكاميرا تنظر لأسفل جداً؛ ارفعها قليلاً.', false); return; }
-    }
-    isScanningFrame = true;
-    try {
-      const preds = await objectModel.detect(videoElement, 5, 0.56);
-      lastCocoPreds = { t: Date.now(), preds: preds || [], vw: videoElement.videoWidth, vh: videoElement.videoHeight };
-      const objects = (preds || []).filter(p => LOCAL_OBJECT_MAP[p.class])
-        .sort((a, b) => ((LOCAL_OBJECT_MAP[b.class].priority || 1) - (LOCAL_OBJECT_MAP[a.class].priority || 1)) || ((b.score || 0) - (a.score || 0)));
-      const top = objects[0];
-      if (!top) { prevCenterThreat = null; return; }
-      const meta = LOCAL_OBJECT_MAP[top.class], pos = getRelativePositionArabic(top.bbox, videoElement.videoWidth);
-      const dist = estimateObjectDistance(top, videoElement.videoWidth, videoElement.videoHeight), area = top.bbox[2] * top.bbox[3], now = Date.now();
-      let loomingUrgent = false;
-      if (meta.priority >= 3 && pos === 'أمامك') {
-        if (prevCenterThreat && prevCenterThreat.cls === top.class && (now - prevCenterThreat.t) < 2000 && prevCenterThreat.area > 0 && ((area - prevCenterThreat.area) / prevCenterThreat.area) >= 0.34) loomingUrgent = true;
-        prevCenterThreat = { cls: top.class, area, t: now };
-      } else prevCenterThreat = null;
-      const key = (loomingUrgent ? 'LOOM_' : 'obj_') + top.class + '_' + pos;
-      if (loomingUrgent || key !== lastHazardAlertKey || (now - lastHazardAlertTime) > 6500) {
-        lastHazardAlertKey = key; lastHazardAlertTime = now;
-        const urgent = loomingUrgent || meta.priority >= 3 || (dist && dist.steps <= 2);
-        playSpatialBeep(sideFromPosition(pos), urgent);
-        vibrate(loomingUrgent ? [120, 45, 120, 45, 120] : (urgent ? [85, 55, 85] : [35]));
-        const msg = loomingUrgent ? ('انتبه! ' + meta.ar + ' تقترب منك بسرعة ' + (dist ? ('— ' + dist.text) : '') + '!') : (meta.ar + ' ' + pos + (dist ? (' — ' + dist.text) : '') + '.');
-        updateStatus(msg); updateRiskIndicator(urgent ? 'يستلزم الحذر' : 'لم يظهر خطر واضح في الصورة'); speak(msg, true);
-      }
-    } catch (e) {} finally { isScanningFrame = false; }
-  }, 1200);
+  liveMonitorTimer = setInterval(liveMonitorTick, 1200);
 }
 function stopLiveMonitoring() { stopLiveRecognition(); if (liveMonitorTimer) { clearInterval(liveMonitorTimer); liveMonitorTimer = null; } }
 function setNavMode(on, announce) {
@@ -3848,7 +3940,7 @@ function speakWait(text) {
     if (!('speechSynthesis' in window)) return res();
     stopSpeaking();
     try {
-      assistantSpeaking = true;
+      assistantSpeaking = true; speechPriority = 0;
       const u = new SpeechSynthesisUtterance(text); u.lang = arabicVoice ? arabicVoice.lang : 'ar-EG'; if (arabicVoice) u.voice = arabicVoice;
       let finished = false, timer = null;
       const done = () => { if (finished) return; finished = true; if (timer) clearTimeout(timer); assistantSpeaking = false; res(); };
